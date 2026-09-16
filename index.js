@@ -7,16 +7,23 @@ const {
 const fs = require("fs");
 const path = require("path");
 
-// Token và Cấu hình Admin
-const TOKEN = process.env.DISCORD_TOKEN || 'MTU0MjIyNDE2NzEx40380583.GWaVZb.EfY6qg0n11bkA3ehEMDOfHB8V_5Z13_Foa2osw';
-const OWNER_ID = process.env.OWNER_ID || '1542224167116480583';
-const ADMIN_USERNAME = 'tdstorevn01';
+const TOKEN = process.env.DISCORD_TOKEN;
+const OWNER_ID = process.env.OWNER_ID;
+if (!TOKEN || !OWNER_ID) {
+  console.error("Thiếu DISCORD_TOKEN hoặc OWNER_ID trong .env");
+  process.exit(1);
+}
 
 const PREFIX = ".";
 const DB_FILE = path.join(__dirname, "data", "db.json");
-const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ
+const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
 const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
+const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
+const LOOP_INTERVAL_MS = 5_000;
+const LOOP_MAX_MESSAGES = 20;
+const treoLoops = new Map();
+const nhayTagLoops = new Map();
 
 function loadDB() {
   try {
@@ -39,6 +46,7 @@ function saveDB() {
 function userData(id) {
   if (!db.users[id]) {
     db.users[id] = {
+      // td = TD Đồng. coins được giữ lại để migrate DB cũ.
       td: "1000",
       coins: "1000",
       realm: 0,
@@ -51,7 +59,7 @@ function userData(id) {
   }
   const u = db.users[id];
   if (u.td == null) u.td = u.coins ?? "1000";
-  if (u.coins == null) u.coins = u.td;
+  if (u.coins == null) u.coins = u.td; // migrate DB cũ
   return u;
 }
 
@@ -64,7 +72,7 @@ function setTD(u, value) {
   const n = BigInt(value);
   const safe = n < 0n ? 0n : n;
   u.td = safe.toString();
-  u.coins = u.td;
+  u.coins = u.td; // giữ tương thích DB cũ
 }
 
 function addTD(u, amount) {
@@ -88,13 +96,11 @@ function ensureAdminWallet(id) {
 }
 
 function isAdmin(message) {
-  return message.author.id === OWNER_ID || 
-         db.admins.includes(message.author.id) || 
-         message.author.username === ADMIN_USERNAME;
+  return message.author.id === OWNER_ID || db.admins.includes(message.author.id);
 }
 
 function isOwner(message) {
-  return message.author.id === OWNER_ID || message.author.username === ADMIN_USERNAME;
+  return message.author.id === OWNER_ID;
 }
 
 function mentionTarget(message) {
@@ -147,6 +153,7 @@ function gameChannelLabel(message) {
 }
 
 // ===================== TÀI XỈU =====================
+// Mỗi guild/channel có một phiên cược. Phiên tự mở bát sau 35 giây.
 const txRounds = new Map();
 
 function txKey(message) {
@@ -174,6 +181,7 @@ function forcedTxType(message) {
 }
 
 function forcedDiceForType(type) {
+  // Tạo một bộ 3 xúc sắc hợp lệ cho Tài/Xỉu.
   if (type === "tai") return [6, 5, 2];
   return [1, 2, 3];
 }
@@ -186,6 +194,7 @@ async function openTxRound(message, key) {
   const forced = forcedTxType(message);
   const dice = forced ? forcedDiceForType(forced) : rollDice();
   const result = txResult(dice);
+  // Override chỉ áp dụng cho đúng một ván rồi tự xoá.
   if (forced) {
     db.settings[message.guildId].txForcedType = null;
   }
@@ -204,6 +213,7 @@ async function openTxRound(message, key) {
     totalPlayers++;
     totalTD += BigInt(bet.amount);
     if (win) {
+      // Cược được tính theo kiểu hoàn vốn + lợi nhuận bằng đúng tiền cược.
       addTD(u, BigInt(bet.amount) * 2n);
       lines.push(`🟢 <@${bet.userId}> thắng +${money(bet.amount)} TDĐ`);
     } else {
@@ -215,8 +225,18 @@ async function openTxRound(message, key) {
   txRounds.delete(key);
 
   const forcedText = forced ? `\n🛡️ Admin override: **${forced === "tai" ? "TÀI" : "XỈU"}**` : "";
+
+  // Gửi video mở bát khoảng 5 giây trước khi hiện kết quả.
+  if (fs.existsSync(OPENING_VIDEO)) {
+    await message.channel.send({
+      content: "🎲 **MỞ BÁT...**",
+      files: [OPENING_VIDEO]
+    });
+    await new Promise(resolve => setTimeout(resolve, 5_000));
+  }
+
   await message.channel.send(
-`🎲 **MỞ BÁT TÀI XỈU**
+`🎲 **KẾT QUẢ TÀI XỈU**
 ${diceLine(dice)}
 🔢 Tổng điểm: **${result.sum}** → **${result.type}**${forcedText}
 👥 Người chơi: **${totalPlayers}**
@@ -250,6 +270,7 @@ async function placeTxBet(message, amount, choice) {
   const newTotal = currentBet + BigInt(amount);
   if (!canAfford(u, newTotal)) return message.reply("❌ Không đủ TDĐ cho tổng cược trong ván này.");
 
+  // Trừ tiền ngay khi đặt cược để không thể spam vượt số dư.
   if (oldBet) {
     setTD(u, tdValue(u) - BigInt(amount));
     oldBet.amount = newTotal.toString();
@@ -279,6 +300,7 @@ const wordGames = new Map();
 const VI_START = ["học sinh", "mặt trời", "bầu trời", "con mèo", "cây xanh", "tình bạn"];
 const EN_START = ["hello world", "good morning", "blue sky", "school bus", "game night", "happy day"];
 
+// Từ điển đủ lớn để xác định một nhánh đã đi vào ngõ cụt.
 const VI_CHAIN = [
   ...VI_START,
   "sinh viên", "viên chức", "chức năng", "năng lượng", "lượng mưa", "mưa rào", "rào chắn",
@@ -366,6 +388,7 @@ async function checkWordGame(message) {
   game.used.add(normalized);
   game.current = text;
 
+  // Mỗi lượt đúng +1.000 TDĐ.
   const u = userData(message.author.id);
   addTD(u, 1000n);
 
@@ -421,7 +444,74 @@ function promote(u) {
   return changed;
 }
 
-// ===================== DISCORD CLIENT =====================
+// ===================== TREO / NHÂY TAG =====================
+function stopTreo(channelId) {
+  const loop = treoLoops.get(channelId);
+  if (!loop) return false;
+  clearInterval(loop.timer);
+  treoLoops.delete(channelId);
+  return true;
+}
+
+function stopNhayTag(channelId) {
+  const loop = nhayTagLoops.get(channelId);
+  if (!loop) return false;
+  clearInterval(loop.timer);
+  nhayTagLoops.delete(channelId);
+  return true;
+}
+
+function loadNhayTagLines() {
+  const file = path.join(__dirname, "data", "nhaytagtd.txt");
+  try {
+    return fs.readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map(x => x.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function startTreo(message, text) {
+  stopTreo(message.channelId);
+  let sent = 0;
+  const sendOne = async () => {
+    if (!treoLoops.has(message.channelId) || sent >= LOOP_MAX_MESSAGES) {
+      stopTreo(message.channelId);
+      return;
+    }
+    sent++;
+    await message.channel.send(text);
+  };
+  const timer = setInterval(sendOne, LOOP_INTERVAL_MS);
+  treoLoops.set(message.channelId, { timer, ownerId: message.author.id });
+  sendOne();
+}
+
+function startNhayTag(message, targetId) {
+  const lines = loadNhayTagLines();
+  if (!lines.length) return false;
+  stopNhayTag(message.channelId);
+  let index = 0;
+  let sent = 0;
+  const sendOne = async () => {
+    if (!nhayTagLoops.has(message.channelId) || sent >= LOOP_MAX_MESSAGES) {
+      stopNhayTag(message.channelId);
+      return;
+    }
+    const text = `<@${targetId}> ${lines[index % lines.length]}`;
+    index++;
+    sent++;
+    await message.channel.send(text);
+  };
+  const timer = setInterval(sendOne, LOOP_INTERVAL_MS);
+  nhayTagLoops.set(message.channelId, { timer, ownerId: message.author.id });
+  sendOne();
+  return true;
+}
+
+// ===================== DISCORD =====================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -439,7 +529,7 @@ client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
 
-    if (message.author.id === OWNER_ID || db.admins.includes(message.author.id) || message.author.username === ADMIN_USERNAME) {
+    if (message.author.id === OWNER_ID || db.admins.includes(message.author.id)) {
       ensureAdminWallet(message.author.id);
     }
 
@@ -481,6 +571,12 @@ client.on("messageCreate", async (message) => {
 \`.tdcode <CODE>\` — Nhập mã thưởng
 \`.tddaily\` — Daily +500 TDĐ
 
+🔁 **TREO / NHÂY TAG**
+\`.treo <nội dung>\` — Lặp nội dung (tối đa 20 tin/lần)
+\`.sttreo\` — Dừng treo
+\`.nhaytag @user\` — Nhây tag theo file nhaytagtd.txt (tối đa 20 tin/lần)
+\`.nhaystop\` — Dừng nhây tag
+
 🛡️ **ADMIN**
 \`.tdadmin @user\`
 \`.tdunadmin @user\`
@@ -518,8 +614,8 @@ client.on("messageCreate", async (message) => {
 
     if (cmd === "tdadmins") {
       if (!isAdmin(message)) return message.reply("⛔ Không có quyền.");
-      const list = db.admins.length ? db.admins.map(id => `<@${id}>`).join("\n") : "Chưa có admin bổ sung.";
-      return message.reply(`🛡️ **BOT ADMINS**\n👑 Owner: <@${OWNER_ID}> (${ADMIN_USERNAME})\n${list}`);
+      const list = db.admins.length ? db.admins.map(id => `<@${id}>`).join("\n") : "Chưa có admin.";
+      return message.reply(`🛡️ **BOT ADMINS**\n👑 Owner: <@${OWNER_ID}>\n${list}`);
     }
 
     // ===== KÊNH GAME =====
@@ -576,6 +672,36 @@ client.on("messageCreate", async (message) => {
       return message.reply(`🎁 Nhập code **${code}** thành công!\n💰 +**${money(rewards[code])} TDĐ**\n💳 Số dư: **${money(tdValue(u))} TDĐ**`);
     }
 
+    // ===== TREO / NHÂY TAG =====
+    if (cmd === "treo") {
+      if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
+      const text = args.join(" ").trim();
+      if (!text) return message.reply("Dùng: `.treo <nội dung>`");
+      if (text.length > 500) return message.reply("❌ Nội dung tối đa 500 ký tự.");
+      startTreo(message, text);
+      return message.reply("🔁 Đã bắt đầu treo. Mỗi 5 giây, tối đa 20 tin/lần.");
+    }
+
+    if (cmd === "sttreo") {
+      if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
+      return message.reply(stopTreo(message.channelId) ? "🛑 Đã dừng treo." : "❌ Kênh này không có treo đang chạy.");
+    }
+
+    if (cmd === "nhaytag") {
+      if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
+      const target = mentionTarget(message);
+      if (!target) return message.reply("Dùng: `.nhaytag @user`");
+      if (target.user.bot) return message.reply("❌ Không nhây tag bot.");
+      const started = startNhayTag(message, target.id);
+      if (!started) return message.reply("❌ Không đọc được data/nhaytagtd.txt.");
+      return message.reply("🏷️ Đã bắt đầu nhây tag. Mỗi 5 giây, tối đa 20 tin/lần.");
+    }
+
+    if (cmd === "nhaystop") {
+      if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
+      return message.reply(stopNhayTag(message.channelId) ? "🛑 Đã dừng nhây tag." : "❌ Kênh này không có nhây tag đang chạy.");
+    }
+
     // ===== MODERATION =====
     if (cmd === "tdban") {
       if (!isAdmin(message)) return message.reply("⛔ Chỉ bot admin mới dùng được.");
@@ -603,6 +729,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // ===== TÀI XỈU ADMIN OVERRIDE =====
+    // Lệnh này không ẩn với người dùng trong log bot: khi có override, bot ghi rõ "Admin override" ở kết quả.
     if (cmd === "adtdtai" || cmd === "adtdxiu") {
       if (!isAdmin(message)) return message.reply("⛔ Chỉ bot admin mới dùng được.");
       if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
@@ -722,11 +849,4 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.login(TOKEN);const http = require('http');
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is running!');
-}).listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+client.login(TOKEN);
