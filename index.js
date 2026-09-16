@@ -20,8 +20,9 @@ const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
 const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
 const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
-const LOOP_INTERVAL_MS = 5_000;
 const LOOP_MAX_MESSAGES = 20;
+const LOOP_MIN_MS = 1_000;
+const LOOP_MAX_MS = 100_000;
 const treoLoops = new Map();
 const nhayTagLoops = new Map();
 
@@ -473,7 +474,7 @@ function loadNhayTagLines() {
   }
 }
 
-function startTreo(message, text) {
+function startTreo(message, text, intervalMs) {
   stopTreo(message.channelId);
   let sent = 0;
   const sendOne = async () => {
@@ -484,13 +485,35 @@ function startTreo(message, text) {
     sent++;
     await message.channel.send(text);
   };
-  const timer = setInterval(sendOne, LOOP_INTERVAL_MS);
+  const timer = setInterval(sendOne, intervalMs);
   treoLoops.set(message.channelId, { timer, ownerId: message.author.id });
   sendOne();
 }
 
-function startNhayTag(message, targetId) {
+function loadNhayCuoiLagLines() {
+  const file = path.join(__dirname, "data", "nhaycuoilag.txt");
+  try {
+    return fs.readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map(x => x.replace(/\r?\n/g, " ").trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function safeOneLine(text, maxLen = 1500) {
+  // Discord giới hạn message 2000 ký tự; giữ 1500 ký tự để còn chỗ cho mention + nhaytag.
+  return String(text ?? "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function startNhayTag(message, targetId, intervalMs) {
   const lines = loadNhayTagLines();
+  const lagLines = loadNhayCuoiLagLines();
   if (!lines.length) return false;
   stopNhayTag(message.channelId);
   let index = 0;
@@ -500,12 +523,19 @@ function startNhayTag(message, targetId) {
       stopNhayTag(message.channelId);
       return;
     }
-    const text = `<@${targetId}> ${lines[index % lines.length]}`;
+
+    const tagText = safeOneLine(lines[index % lines.length], 600);
+    const lagText = lagLines.length
+      ? safeOneLine(lagLines[index % lagLines.length], 1200)
+      : "";
+
+    // Một lần gửi = đúng một Discord message, không dùng \n.
+    const text = safeOneLine(`<@${targetId}> ${tagText} ${lagText}`, 1950);
     index++;
     sent++;
     await message.channel.send(text);
   };
-  const timer = setInterval(sendOne, LOOP_INTERVAL_MS);
+  const timer = setInterval(sendOne, intervalMs);
   nhayTagLoops.set(message.channelId, { timer, ownerId: message.author.id });
   sendOne();
   return true;
@@ -675,11 +705,14 @@ client.on("messageCreate", async (message) => {
     // ===== TREO / NHÂY TAG =====
     if (cmd === "treo") {
       if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
-      const text = args.join(" ").trim();
-      if (!text) return message.reply("Dùng: `.treo <nội dung>`");
+      const durationArg = args.find(x => /^\d+s$/i.test(x));
+      const intervalMs = durationArg ? parseDuration(durationArg) : null;
+      const text = args.filter(x => x !== durationArg).join(" ").trim();
+      if (!text || !durationArg) return message.reply("Dùng: `.treo <nội dung> <1-100s>`\nVí dụ: `.treo hello 5s`");
+      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
       if (text.length > 500) return message.reply("❌ Nội dung tối đa 500 ký tự.");
-      startTreo(message, text);
-      return message.reply("🔁 Đã bắt đầu treo. Mỗi 5 giây, tối đa 20 tin/lần.");
+      startTreo(message, text, intervalMs);
+      return message.reply(`🔁 Đã bắt đầu treo mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`);
     }
 
     if (cmd === "sttreo") {
@@ -690,11 +723,14 @@ client.on("messageCreate", async (message) => {
     if (cmd === "nhaytag") {
       if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
       const target = mentionTarget(message);
-      if (!target) return message.reply("Dùng: `.nhaytag @user`");
+      const durationArg = args.find(x => /^\d+s$/i.test(x));
+      const intervalMs = durationArg ? parseDuration(durationArg) : null;
+      if (!target || !durationArg) return message.reply("Dùng: `.nhaytag @user <1-100s>`\nVí dụ: `.nhaytag @user 5s`");
+      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
       if (target.user.bot) return message.reply("❌ Không nhây tag bot.");
-      const started = startNhayTag(message, target.id);
+      const started = startNhayTag(message, target.id, intervalMs);
       if (!started) return message.reply("❌ Không đọc được data/nhaytagtd.txt.");
-      return message.reply("🏷️ Đã bắt đầu nhây tag. Mỗi 5 giây, tối đa 20 tin/lần.");
+      return message.reply(`🏷️ Đã bắt đầu nhay tag mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`);
     }
 
     if (cmd === "nhaystop") {
