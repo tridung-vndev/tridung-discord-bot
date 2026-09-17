@@ -30,7 +30,7 @@ const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
 const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
 const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
-const LOOP_MAX_MESSAGES = 20;
+const LOOP_MAX_MESSAGES = 10000;
 const LOOP_MIN_MS = 1_000;
 const LOOP_MAX_MS = 100_000;
 const treoLoops = new Map();
