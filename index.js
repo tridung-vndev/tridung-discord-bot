@@ -909,7 +909,7 @@ client.on("messageCreate", async (message) => {
     }
 
     if (message.guild && await checkWordGame(message)) return;
-    if (message.content.trim().toLowerCase() === "!dmenu") {
+    if ([".dmenu", "!dmenu"].includes(message.content.trim().toLowerCase())) {
       const payload = { embeds: [dmenuEmbed(client)], components: dmenuButtons() };
       if (fs.existsSync(DMENU_BANNER)) {
         const file = new AttachmentBuilder(DMENU_BANNER);
@@ -1248,4 +1248,12 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.login(TOKEN);
+client.once("ready", () => {
+  console.log(`READY: ${client.user.tag}`);
+  console.log(`Guilds: ${client.guilds.cache.size}`);
+});
+
+client.login(TOKEN).catch((err) => {
+  console.error("Discord login failed:", err?.message || err);
+  process.exit(1);
+});
