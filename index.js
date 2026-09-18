@@ -491,7 +491,7 @@ function stopNhayTag(channelId) {
 }
 
 function loadNhayTagLines() {
-  const file = path.join(__dirname, "data", "nhaytagtd.txt");
+  const file = path.join(__dirname, "data", "nhay.txt");
   try {
     return fs.readFileSync(file, "utf8")
       .split(/\r?\n/)
@@ -857,7 +857,7 @@ client.on("interactionCreate", async (interaction) => {
         if (member.user.bot) return interaction.reply({ content: "❌ Không nhây tag bot.", ephemeral: true });
         const fake = { guild: interaction.guild, guildId: interaction.guildId, channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
         const started = startNhayTag(fake, targetId, 5_000);
-        if (!started) return interaction.reply({ content: "❌ Không đọc được data/nhaytagtd.txt.", ephemeral: true });
+        if (!started) return interaction.reply({ content: "❌ Không đọc được data/nhay.txt.", ephemeral: true });
         return interaction.reply({ content: `🏷️ Đã bắt đầu nhây tag <@${targetId}> mỗi **5s**. Tối đa **${LOOP_MAX_MESSAGES} tin**; dùng nút Stop hoặc \.nhaystop để dừng.`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("nhay_stop_button").setLabel("Stop").setStyle(ButtonStyle.Danger))] });
       }
       const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
@@ -883,8 +883,10 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
   } catch (err) {
-    console.error(err);
-    if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: "❌ Lỗi xử lý nút.", ephemeral: true });
+    console.error("Interaction error:", err?.stack || err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: `❌ Lỗi xử lý nút: ${String(err?.message || err).slice(0, 180)}`, ephemeral: true }).catch(() => {});
+    }
   }
 });
 
@@ -948,7 +950,7 @@ client.on("messageCreate", async (message) => {
 🔁 **TREO / NHÂY TAG**
 \`.treo <nội dung>\` — Lặp nội dung (tối đa 100 tin/lần)
 \`.sttreo\` — Dừng treo
-\`.nhaytag @user\` — Nhây tag theo file nhaytagtd.txt (tối đa 100 tin/lần)
+\`.nhaytag @user\` — Nhây tag theo file nhay.txt (tối đa 100 tin/lần)
 \`.nhaystop\` — Dừng nhây tag
 
 🛡️ **ADMIN**
@@ -1073,7 +1075,7 @@ client.on("messageCreate", async (message) => {
       if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
       if (target.user.bot) return message.reply("❌ Không nhây tag bot.");
       const started = startNhayTag(message, target.id, intervalMs);
-      if (!started) return message.reply("❌ Không đọc được data/nhaytagtd.txt.");
+      if (!started) return message.reply("❌ Không đọc được data/nhay.txt.");
       return message.reply(`🏷️ Đã bắt đầu nhay tag mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`);
     }
 
