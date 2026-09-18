@@ -37,8 +37,8 @@ const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
 const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
 const LOOP_MAX_MESSAGES = 100;
-const LOOP_MIN_MS = 1_000;
-const LOOP_MAX_MS = 100_000;
+const LOOP_MIN_MS = 1_000; // Discord-safe minimum: 1s
+const LOOP_MAX_MS = 1_000_000; // 1000s
 const treoLoops = new Map();
 const nhayTagLoops = new Map();
 const stockRounds = new Map();
@@ -818,7 +818,7 @@ client.on("interactionCreate", async (interaction) => {
         const modal = new ModalBuilder().setCustomId("treo_modal").setTitle("Treo tin nhắn");
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("text").setLabel("Nội dung").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-100s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-1000s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
         );
         return interaction.showModal(modal);
       }
@@ -839,7 +839,7 @@ client.on("interactionCreate", async (interaction) => {
         const modal = new ModalBuilder().setCustomId("treo_modal").setTitle("Treo tin nhắn");
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("text").setLabel("Nội dung").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-100s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-1000s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
         );
         return interaction.showModal(modal);
       }
@@ -860,6 +860,17 @@ client.on("interactionCreate", async (interaction) => {
         if (!started) return interaction.reply({ content: "❌ Không đọc được data/nhay.txt.", ephemeral: true });
         return interaction.reply({ content: `🏷️ Đã bắt đầu nhây tag <@${targetId}> mỗi **5s**. Tối đa **${LOOP_MAX_MESSAGES} tin**; dùng nút Stop hoặc \.nhaystop để dừng.`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("nhay_stop_button").setLabel("Stop").setStyle(ButtonStyle.Danger))] });
       }
+      if (interaction.customId === "treo_modal") {
+        const text = interaction.fields.getTextInputValue("text").trim();
+        const intervalArg = interaction.fields.getTextInputValue("interval").trim();
+        const ms = parseDuration(intervalArg);
+        if (!text || text.length > 500 || !ms || ms < LOOP_MIN_MS || ms > LOOP_MAX_MS) return interaction.reply({ content: "❌ Nội dung tối đa 500 ký tự, thời gian 1-1000s.", ephemeral: true });
+        const fake = { channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
+        startTreo(fake, text, ms);
+        return interaction.reply({ content: `🟢 Đã **Treo** mỗi ${intervalArg}. Dùng nút **Stop** hoặc \`.sttreo\` để dừng.`, components: treoButtons(true) });
+      }
+
+      // Chỉ các modal cược mới đọc field "amount". Modal Treo không có field này.
       const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
       if (interaction.customId === "tx_modal_xiu" || interaction.customId === "tx_modal_tai") {
         if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
@@ -871,15 +882,6 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.customId === "stock_modal_buy" || interaction.customId === "stock_modal_sell") {
         if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
         return placeStockBet(interaction, interaction.customId.endsWith("buy") ? "buy" : "sell", amount);
-      }
-      if (interaction.customId === "treo_modal") {
-        const text = interaction.fields.getTextInputValue("text").trim();
-        const intervalArg = interaction.fields.getTextInputValue("interval").trim();
-        const ms = parseDuration(intervalArg);
-        if (!text || text.length > 500 || !ms || ms < LOOP_MIN_MS || ms > LOOP_MAX_MS) return interaction.reply({ content: "❌ Nội dung tối đa 500 ký tự, thời gian 1-100s.", ephemeral: true });
-        const fake = { channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
-        startTreo(fake, text, ms);
-        return interaction.reply({ content: `🟢 Đã **Treo** mỗi ${intervalArg}. Dùng nút **Stop** hoặc \`.sttreo\` để dừng.`, components: treoButtons(true) });
       }
     }
   } catch (err) {
@@ -1054,8 +1056,8 @@ client.on("messageCreate", async (message) => {
       const durationArg = args.find(x => /^\d+s$/i.test(x));
       const intervalMs = durationArg ? parseDuration(durationArg) : null;
       const text = args.filter(x => x !== durationArg).join(" ").trim();
-      if (!text || !durationArg) return message.reply("Dùng: `.treo <nội dung> <1-100s>`\nVí dụ: `.treo hello 5s`");
-      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
+      if (!text || !durationArg) return message.reply("Dùng: `.treo <nội dung> <1-1000s>`\nVí dụ: `.treo hello 5s`");
+      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 1000s**.");
       if (text.length > 500) return message.reply("❌ Nội dung tối đa 500 ký tự.");
       startTreo(message, text, intervalMs);
       return message.reply({ content: `🟢 Đã **Treo** mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`, components: treoButtons(true) });
@@ -1071,8 +1073,8 @@ client.on("messageCreate", async (message) => {
       const target = mentionTarget(message);
       const durationArg = args.find(x => /^\d+s$/i.test(x));
       const intervalMs = durationArg ? parseDuration(durationArg) : null;
-      if (!target || !durationArg) return message.reply("Dùng: `.nhaytag @user <1-100s>`\nVí dụ: `.nhaytag @user 5s`");
-      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
+      if (!target || !durationArg) return message.reply("Dùng: `.nhaytag @user <1-1000s>`\nVí dụ: `.nhaytag @user 5s`");
+      if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 1000s**.");
       if (target.user.bot) return message.reply("❌ Không nhây tag bot.");
       const started = startNhayTag(message, target.id, intervalMs);
       if (!started) return message.reply("❌ Không đọc được data/nhay.txt.");
