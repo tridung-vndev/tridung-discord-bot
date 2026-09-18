@@ -1,18 +1,23 @@
 const http = require("http");
-
 const PORT = process.env.PORT || 10000;
-
 http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
   res.end("TriDung Dev Bot is running!");
-}).listen(PORT, "0.0.0.0", () => {
-  console.log(`Web server running on port ${PORT}`);
-});
+}).listen(PORT, "0.0.0.0", () => console.log(`Web server running on port ${PORT}`));
+
 require("dotenv").config();
 
 const {
   Client,
   GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  AttachmentBuilder,
 } = require("discord.js");
 const fs = require("fs");
 const path = require("path");
@@ -30,11 +35,16 @@ const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
 const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
 const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
-const LOOP_MAX_MESSAGES = 10000;
+const LOOP_MAX_MESSAGES = 100;
 const LOOP_MIN_MS = 1_000;
 const LOOP_MAX_MS = 100_000;
 const treoLoops = new Map();
 const nhayTagLoops = new Map();
+const stockRounds = new Map();
+const STOCK_WINDOW_MS = 15_000;
+const STOCK_IMAGE_BUY = path.join(__dirname, "assets", "stock-buy.jpg");
+const STOCK_IMAGE_SELL = path.join(__dirname, "assets", "stock-sell.jpg");
+const DICE_GIF = path.join(__dirname, "assets", "dice-roll.gif");
 
 function loadDB() {
   try {
@@ -237,8 +247,14 @@ async function openTxRound(message, key) {
 
   const forcedText = forced ? `\n🛡️ Admin override: **${forced === "tai" ? "TÀI" : "XỈU"}**` : "";
 
-  // Gửi video mở bát khoảng 5 giây trước khi hiện kết quả.
-  if (fs.existsSync(OPENING_VIDEO)) {
+  // Mở bát: dùng GIF xúc sắc quay, rồi mới công bố kết quả.
+  if (fs.existsSync(DICE_GIF)) {
+    await message.channel.send({
+      content: "🎲 **XÚC SẮC ĐANG QUAY...**",
+      files: [DICE_GIF]
+    });
+    await new Promise(resolve => setTimeout(resolve, 2_200));
+  } else if (fs.existsSync(OPENING_VIDEO)) {
     await message.channel.send({
       content: "🎲 **MỞ BÁT...**",
       files: [OPENING_VIDEO]
@@ -551,6 +567,134 @@ function startNhayTag(message, targetId, intervalMs) {
   return true;
 }
 
+// ===================== NÚT BẤM / UI =====================
+function treoButtons(active = true) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("treo_start").setLabel("Treo").setStyle(ButtonStyle.Success).setDisabled(active),
+    new ButtonBuilder().setCustomId("treo_stop").setLabel("Stop").setStyle(ButtonStyle.Danger).setDisabled(!active)
+  )];
+}
+
+function txButtons() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("tx_xiu").setLabel("3-10 Xỉu").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("tx_tai").setLabel("11-18 Tài").setStyle(ButtonStyle.Primary)
+  )];
+}
+
+function stockButtons() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("stock_buy").setLabel("MUA").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("stock_sell").setLabel("BÁN").setStyle(ButtonStyle.Danger)
+  )];
+}
+
+function dmenuButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu_tx").setLabel("🎲 Tài Xỉu").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("menu_stock").setLabel("📈 Chứng khoán").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("menu_treo").setLabel("🔁 Treo").setStyle(ButtonStyle.Success)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu_games").setLabel("🎮 Game").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("menu_coin").setLabel("💰 TD Đồng").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("menu_stop").setLabel("🛑 Stop").setStyle(ButtonStyle.Danger)
+    )
+  ];
+}
+
+function txMenuText() {
+  return `🎲 **TÀI XỈU — MỞ BÁT 35 GIÂY**\n\n🔴 **3-10 XỈU**\n🟧 **11-18 TÀI**\n\nBấm nút để chọn cửa, sau đó nhập số TDĐ trong cửa sổ hiện ra.`;
+}
+
+function stockMenuText() {
+  return `📈 **TD STOCK — VÁN 15 GIÂY**\n\n🟢 **MUA** = dự đoán giá tăng\n🔴 **BÁN** = dự đoán giá giảm\n\nMỗi ván kéo dài **15 giây**. Hết giờ bot công bố biến động giá, kết quả và ảnh biểu đồ.\n\n⚠️ Đây là **game mô phỏng bằng TDĐ**, tỷ lệ biến động được tạo ngẫu nhiên theo khoảng giống thị trường; không phải dữ liệu/chứng khoán thật.`;
+}
+
+function createAmountModal(customId, title, actionLabel) {
+  return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("amount").setLabel("Số TDĐ").setStyle(TextInputStyle.Short).setPlaceholder("Ví dụ: 1000").setRequired(true).setMinLength(1).setMaxLength(18)
+    )
+  );
+}
+
+function parseAmount(value) {
+  if (!/^\d+$/.test(String(value || ""))) return null;
+  try { const n = BigInt(value); return n > 0n ? n : null; } catch { return null; }
+}
+
+function stockKey(message) { return `${message.guildId}:${message.channelId}`; }
+
+async function finishStockRound(message, key) {
+  const round = stockRounds.get(key);
+  if (!round || round.finished) return;
+  round.finished = true;
+  const movement = (Math.random() * 16 - 8); // mô phỏng -8% .. +8%
+  const up = movement >= 0;
+  const priceBefore = 100 + Math.random() * 30;
+  const priceAfter = priceBefore * (1 + movement / 100);
+  const resultLines = [];
+  for (const bet of round.bets.values()) {
+    const u = userData(bet.userId);
+    const win = (bet.choice === "buy" && up) || (bet.choice === "sell" && !up);
+    if (win) {
+      addTD(u, BigInt(bet.amount) * 2n);
+      resultLines.push(`🟢 <@${bet.userId}> **${bet.choice === "buy" ? "MUA" : "BÁN"}** thắng +${money(bet.amount)} TDĐ`);
+    } else {
+      resultLines.push(`🔴 <@${bet.userId}> **${bet.choice === "buy" ? "MUA" : "BÁN"}** thua -${money(bet.amount)} TDĐ`);
+    }
+  }
+  saveDB();
+  stockRounds.delete(key);
+  const imgPath = up ? STOCK_IMAGE_BUY : STOCK_IMAGE_SELL;
+  const file = fs.existsSync(imgPath) ? new AttachmentBuilder(imgPath) : null;
+  const direction = up ? "TĂNG" : "GIẢM";
+  const sign = movement >= 0 ? "+" : "";
+  const embed = new EmbedBuilder()
+    .setTitle(`📈 KẾT QUẢ TD STOCK — ${direction}`)
+    .setDescription(`💹 Giá mở: **${priceBefore.toFixed(2)}**\n📊 Biến động: **${sign}${movement.toFixed(2)}%**\n🏁 Giá đóng: **${priceAfter.toFixed(2)}**\n\n${resultLines.length ? resultLines.join("\n") : "Không có lệnh."}`)
+    .setTimestamp();
+  if (file) embed.setImage(`attachment://${path.basename(imgPath)}`);
+  await message.channel.send({ embeds: [embed], ...(file ? { files: [file] } : {}) });
+}
+
+function startStockRound(message) {
+  const key = stockKey(message);
+  let round = stockRounds.get(key);
+  if (round && !round.finished) return false;
+  round = { createdAt: Date.now(), bets: new Map(), finished: false };
+  stockRounds.set(key, round);
+  setTimeout(() => finishStockRound(message, key), STOCK_WINDOW_MS);
+  return true;
+}
+
+async function placeStockBet(interaction, choice, amount) {
+  const message = interaction.message;
+  const key = stockKey(message);
+  let round = stockRounds.get(key);
+  if (!round) {
+    startStockRound(message);
+    round = stockRounds.get(key);
+  }
+  if (!round || round.finished) return interaction.reply({ content: "⛔ Ván đã kết thúc.", ephemeral: true });
+  const u = userData(interaction.user.id);
+  const old = round.bets.get(interaction.user.id);
+  if (!canAfford(u, amount)) return interaction.reply({ content: "❌ Không đủ TDĐ.", ephemeral: true });
+  if (old) {
+    setTD(u, tdValue(u) - amount);
+    old.amount = (BigInt(old.amount) + amount).toString();
+    old.choice = choice;
+  } else {
+    setTD(u, tdValue(u) - amount);
+    round.bets.set(interaction.user.id, { userId: interaction.user.id, amount: amount.toString(), choice });
+  }
+  saveDB();
+  const left = Math.max(0, STOCK_WINDOW_MS - (Date.now() - round.createdAt));
+  return interaction.reply({ content: `📈 Đã đặt **${money(amount)} TDĐ** vào **${choice === "buy" ? "MUA" : "BÁN"}**. Còn ~**${Math.ceil(left / 1000)}s**.`, ephemeral: true });
+}
+
 // ===================== DISCORD =====================
 const client = new Client({
   intents: [
@@ -565,6 +709,70 @@ client.once("ready", () => {
   console.log(`Bot online: ${client.user.tag}`);
 });
 
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+      if (id === "menu_tx") return interaction.reply({ content: txMenuText(), components: txButtons(), ephemeral: true });
+      if (id === "menu_stock") return interaction.reply({ content: stockMenuText(), components: stockButtons(), ephemeral: true });
+      if (id === "menu_treo") {
+        const modal = new ModalBuilder().setCustomId("treo_modal").setTitle("Treo tin nhắn");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("text").setLabel("Nội dung").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-100s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
+        );
+        return interaction.showModal(modal);
+      }
+      if (id === "menu_games") return interaction.reply({ content: `🎮 **GAME**\n\`.tx\` — Tài Xỉu\n\`.bc\` — Bầu Cua\n\`.nttv\` — Nối từ Việt\n\`.ntel\` — Nối từ Anh\n\`.tutien\` — Tu Tiên`, ephemeral: true });
+      if (id === "menu_coin") return interaction.reply({ content: `💰 Dùng \`.tdcoin\` để xem số dư TDĐ.`, ephemeral: true });
+      if (id === "menu_stop") {
+        const a = stopTreo(interaction.channelId);
+        const b = stopNhayTag(interaction.channelId);
+        return interaction.reply({ content: (a || b) ? "🛑 Đã dừng vòng lặp đang chạy." : "❌ Không có vòng lặp để dừng.", ephemeral: true });
+      }
+      if (id === "treo_stop") {
+        return interaction.reply({ content: stopTreo(interaction.channelId) ? "🛑 Đã dừng treo." : "❌ Không có treo đang chạy.", ephemeral: true });
+      }
+      if (id === "treo_start") {
+        const modal = new ModalBuilder().setCustomId("treo_modal").setTitle("Treo tin nhắn");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("text").setLabel("Nội dung").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-100s)").setStyle(TextInputStyle.Short).setPlaceholder("5s").setRequired(true))
+        );
+        return interaction.showModal(modal);
+      }
+      if (id === "tx_xiu" || id === "tx_tai") return interaction.showModal(createAmountModal(id === "tx_xiu" ? "tx_modal_xiu" : "tx_modal_tai", id === "tx_xiu" ? "Cược 3-10 Xỉu" : "Cược 11-18 Tài"));
+      if (id === "stock_buy" || id === "stock_sell") return interaction.showModal(createAmountModal(id === "stock_buy" ? "stock_modal_buy" : "stock_modal_sell", id === "stock_buy" ? "MUA TD STOCK" : "BÁN TD STOCK"));
+    }
+    if (interaction.isModalSubmit()) {
+      const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
+      if (interaction.customId === "tx_modal_xiu" || interaction.customId === "tx_modal_tai") {
+        if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
+        const choice = interaction.customId.endsWith("xiu") ? "xiu" : "tai";
+        const fake = interaction.message;
+        const msg = { guildId: interaction.guildId, channelId: interaction.channelId, author: interaction.user, guild: interaction.guild, channel: interaction.channel, reply: (x) => interaction.reply(x) };
+        return placeTxBet(msg, amount, choice);
+      }
+      if (interaction.customId === "stock_modal_buy" || interaction.customId === "stock_modal_sell") {
+        if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
+        return placeStockBet(interaction, interaction.customId.endsWith("buy") ? "buy" : "sell", amount);
+      }
+      if (interaction.customId === "treo_modal") {
+        const text = interaction.fields.getTextInputValue("text").trim();
+        const intervalArg = interaction.fields.getTextInputValue("interval").trim();
+        const ms = parseDuration(intervalArg);
+        if (!text || text.length > 500 || !ms || ms < LOOP_MIN_MS || ms > LOOP_MAX_MS) return interaction.reply({ content: "❌ Nội dung tối đa 500 ký tự, thời gian 1-100s.", ephemeral: true });
+        const fake = { channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
+        startTreo(fake, text, ms);
+        return interaction.reply({ content: `🟢 Đã **Treo** mỗi ${intervalArg}. Dùng nút **Stop** hoặc \`.sttreo\` để dừng.`, components: treoButtons(true) });
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: "❌ Lỗi xử lý nút.", ephemeral: true });
+  }
+});
+
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) return;
@@ -574,6 +782,13 @@ client.on("messageCreate", async (message) => {
     }
 
     if (message.guild && await checkWordGame(message)) return;
+    if (message.content.startsWith("!dmenu")) {
+      return message.reply({
+        content: `🎮 **TRIDUNG DEV MENU**\nChọn tính năng bằng nút bên dưới.\n\n🎲 Tài Xỉu: 35 giây\n📈 Chứng khoán: 15 giây\n🔁 Treo: có nút Treo/Stop\n💰 Tất cả dùng **TDĐ**`,
+        components: dmenuButtons()
+      });
+    }
+
     if (!message.content.startsWith(PREFIX)) return;
 
     const raw = message.content.slice(PREFIX.length).trim();
@@ -583,7 +798,8 @@ client.on("messageCreate", async (message) => {
     const args = parts;
 
     const gameCommands = new Set([
-      "game", "tx", "cau", "bc", "nttv", "ntel", "ntstop",
+      "game",
+      "stock", "tx", "cau", "bc", "nttv", "ntel", "ntstop",
       "tutien", "tu", "tuluyen", "tl", "tudanh",
       "tddaily"
     ]);
@@ -612,9 +828,9 @@ client.on("messageCreate", async (message) => {
 \`.tddaily\` — Daily +500 TDĐ
 
 🔁 **TREO / NHÂY TAG**
-\`.treo <nội dung>\` — Lặp nội dung (tối đa 20 tin/lần)
+\`.treo <nội dung>\` — Lặp nội dung (tối đa 100 tin/lần)
 \`.sttreo\` — Dừng treo
-\`.nhaytag @user\` — Nhây tag theo file nhaytagtd.txt (tối đa 20 tin/lần)
+\`.nhaytag @user\` — Nhây tag theo file nhaytagtd.txt (tối đa 100 tin/lần)
 \`.nhaystop\` — Dừng nhây tag
 
 🛡️ **ADMIN**
@@ -722,7 +938,7 @@ client.on("messageCreate", async (message) => {
       if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) return message.reply("❌ Thời gian phải từ **1s đến 100s**.");
       if (text.length > 500) return message.reply("❌ Nội dung tối đa 500 ký tự.");
       startTreo(message, text, intervalMs);
-      return message.reply(`🔁 Đã bắt đầu treo mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`);
+      return message.reply({ content: `🟢 Đã **Treo** mỗi **${durationArg}** (tối đa ${LOOP_MAX_MESSAGES} tin).`, components: treoButtons(true) });
     }
 
     if (cmd === "sttreo") {
@@ -798,8 +1014,15 @@ client.on("messageCreate", async (message) => {
       const bet = /^\d+$/.test(betRaw || "") ? BigInt(betRaw) : 0n;
       const choiceRaw = (args[1] || "").toLowerCase();
       const choice = ["tai", "tài"].includes(choiceRaw) ? "tai" : ["xiu", "xỉu"].includes(choiceRaw) ? "xiu" : null;
-      if (bet <= 0n || !choice) return message.reply("🎲 Dùng: `.tx <TDĐ> <tai|xiu>`\nVí dụ: `.tx 1000 tai`");
+      if (bet <= 0n || !choice) return message.reply({ content: txMenuText(), components: txButtons() });
       return placeTxBet(message, bet, choice);
+    }
+
+    // ===== CHỨNG KHOÁN =====
+    if (cmd === "stock" || cmd === "chungkhoan" || cmd === "ck") {
+      if (!message.guild) return message.reply("❌ Chỉ dùng trong server.");
+      if (!startStockRound(message)) return message.reply("⏳ Ván chứng khoán hiện tại vẫn đang chạy.");
+      return message.reply({ content: `${stockMenuText()}\n\n⏱️ **15s bắt đầu từ bây giờ.**`, components: stockButtons() });
     }
 
     // ===== BẦU CUA =====
