@@ -678,6 +678,9 @@ function nhayTagModal() {
   return new ModalBuilder().setCustomId("nhaytag_id_modal").setTitle("Nhây Tag").addComponents(
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId("target_id").setLabel("ID người dùng").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true).setMinLength(17).setMaxLength(20)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("interval").setLabel("Khoảng cách (1-1000s)").setStyle(TextInputStyle.Short).setPlaceholder("1s").setRequired(true)
     )
   );
 }
@@ -855,10 +858,15 @@ client.on("interactionCreate", async (interaction) => {
         const member = await interaction.guild.members.fetch(targetId).catch(() => null);
         if (!member) return interaction.reply({ content: "❌ Không tìm thấy người dùng này trong server.", ephemeral: true });
         if (member.user.bot) return interaction.reply({ content: "❌ Không nhây tag bot.", ephemeral: true });
+        const intervalArg = interaction.fields.getTextInputValue("interval").trim();
+        const intervalMs = parseDuration(intervalArg);
+        if (!intervalMs || intervalMs < LOOP_MIN_MS || intervalMs > LOOP_MAX_MS) {
+          return interaction.reply({ content: "❌ Thời gian phải từ **1s đến 1000s**. Ví dụ: `1s`, `10s`, `1000s`.", ephemeral: true });
+        }
         const fake = { guild: interaction.guild, guildId: interaction.guildId, channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
-        const started = startNhayTag(fake, targetId, 5_000);
+        const started = startNhayTag(fake, targetId, intervalMs);
         if (!started) return interaction.reply({ content: "❌ Không đọc được data/nhay.txt.", ephemeral: true });
-        return interaction.reply({ content: `🏷️ Đã bắt đầu nhây tag <@${targetId}> mỗi **5s**. Tối đa **${LOOP_MAX_MESSAGES} tin**; dùng nút Stop hoặc \.nhaystop để dừng.`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("nhay_stop_button").setLabel("Stop").setStyle(ButtonStyle.Danger))] });
+        return interaction.reply({ content: `🏷️ Đã bắt đầu nhây tag <@${targetId}> mỗi **${intervalArg}**. Tối đa **${LOOP_MAX_MESSAGES} tin**; dùng nút Stop hoặc \.nhaystop để dừng.`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("nhay_stop_button").setLabel("Stop").setStyle(ButtonStyle.Danger))] });
       }
       if (interaction.customId === "treo_modal") {
         const text = interaction.fields.getTextInputValue("text").trim();
