@@ -21,6 +21,7 @@ const {
 } = require("discord.js");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
@@ -45,6 +46,7 @@ const STOCK_WINDOW_MS = 15_000;
 const STOCK_IMAGE_BUY = path.join(__dirname, "assets", "stock-buy.jpg");
 const STOCK_IMAGE_SELL = path.join(__dirname, "assets", "stock-sell.jpg");
 const DICE_GIF = path.join(__dirname, "assets", "dice-roll.gif");
+const DMENU_BANNER = path.join(__dirname, "assets", "dmenu-banner.jpg");
 
 function loadDB() {
   try {
@@ -594,9 +596,12 @@ function dmenuButtons() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("menu_tx").setLabel("🎲 Tài Xỉu").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("menu_stock").setLabel("📈 Chứng khoán").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("menu_treo").setLabel("🔁 Treo").setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId("menu_treo").setLabel("🔁 Treo").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("menu_tutien").setLabel("🌌 Tu Tiên").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("menu_admin").setLabel("🛡️ Admin").setStyle(ButtonStyle.Danger)
     ),
     new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("menu_nhaytag").setLabel("🏷️ Nhây Tag").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("menu_games").setLabel("🎮 Game").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("menu_coin").setLabel("💰 TD Đồng").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("menu_stop").setLabel("🛑 Stop").setStyle(ButtonStyle.Danger)
@@ -604,8 +609,77 @@ function dmenuButtons() {
   ];
 }
 
+function tutienButtons() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("tutien_luyen").setLabel("⚔️ Tu Luyện").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("tutien_profile").setLabel("📜 Hồ Sơ").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("back_dmenu").setLabel("↩️ Quay lại").setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function adminMenuButtons() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("admin_commands").setLabel("🛡️ Lệnh Admin").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("back_dmenu").setLabel("↩️ Quay lại").setStyle(ButtonStyle.Secondary)
+  )];
+}
+
+function formatUptime(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${d}d ${h}h ${m}m ${s}s`;
+}
+
+function cpuLoadText() {
+  const loads = os.loadavg();
+  // Trên Linux/Render dùng load average 1 phút; không phải % CPU chính xác.
+  return `${loads[0].toFixed(2)} load`;
+}
+
+function dmenuEmbed(client) {
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle("✦ TÂM ĐIỂM ĐIỀU KHIỂN ✦")
+    .setDescription(
+      `Xin chào **${client.user.username}** 👋\n` +
+      `Hãy chạm vào các nút bên dưới để truy cập tính năng.\n\n` +
+      `👑 **Developer**\n**Trí Dũng <The Alex>**\n\n` +
+      `📡 **Ping**\n**${client.ws.ping}ms**\n\n` +
+      `💻 **CPU Load**\n**${cpuLoadText()}**\n\n` +
+      `⏱️ **Uptime**\n**${formatUptime(client.uptime || 0)}**\n\n` +
+      `🌐 **Máy chủ**\n**${client.guilds.cache.size}**`
+    )
+    .setFooter({ text: "TRIDUNG DEV • !dmenu" })
+    .setTimestamp();
+}
+
 function txMenuText() {
   return `🎲 **TÀI XỈU — MỞ BÁT 35 GIÂY**\n\n🔴 **3-10 XỈU**\n🟧 **11-18 TÀI**\n\nBấm nút để chọn cửa, sau đó nhập số TDĐ trong cửa sổ hiện ra.`;
+}
+
+function adminMenuText() {
+  return `🛡️ **MENU ADMIN**\n\n` +
+    `• \.tdadmins — Xem danh sách admin\n` +
+    `• \.tdadmin @user — Thêm admin\n` +
+    `• \.tdunadmin @user — Xóa admin\n` +
+    `• \.tdaddcoin @user <TDĐ> — Cộng TDĐ\n` +
+    `• \.tdsubcoin @user <TDĐ> — Trừ TDĐ\n` +
+    `• \.tdmute @user <thời gian> — Mute\n` +
+    `• \.tdban @user — Ban\n` +
+    `• \.tdchannel #kênh — Đặt kênh game\n` +
+    `• \.adtdtai / \.adtdxiu — Override ván TX tiếp theo\n\n` +
+    `⚠️ Chỉ OWNER/ADMIN mới thực thi được các lệnh trên.`;
+}
+
+function nhayTagModal() {
+  return new ModalBuilder().setCustomId("nhaytag_id_modal").setTitle("Nhây Tag").addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("target_id").setLabel("ID người dùng").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true).setMinLength(17).setMaxLength(20)
+    )
+  );
 }
 
 function stockMenuText() {
@@ -713,6 +787,31 @@ client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) {
       const id = interaction.customId;
+      if (id === "back_dmenu") {
+        const payload = { embeds: [dmenuEmbed(client)], components: dmenuButtons(), files: [] };
+        return interaction.update(payload);
+      }
+      if (id === "menu_tutien") {
+        return interaction.reply({ content: `🌌 **TU TIÊN**\n\nChọn một chức năng:`, components: tutienButtons(), ephemeral: true });
+      }
+      if (id === "tutien_luyen") {
+        return interaction.reply({ content: `⚔️ **TU LUYỆN**\n\nDùng \.tuluyen để tu luyện và nhận EXP.`, ephemeral: true });
+      }
+      if (id === "tutien_profile") {
+        const u = userData(interaction.user.id);
+        const realm = REALMS[u.realm] || REALMS[0];
+        return interaction.reply({ content: `📜 **HỒ SƠ TU TIÊN**\n👤 ${interaction.user}\n🌌 Cảnh giới: **${realm.name}**\n✨ EXP: **${u.exp}**\n⚔️ ATK: **${u.attack}**\n🛡️ DEF: **${u.defense}**\n❤️ HP: **${u.hp}**\n💰 TDĐ: **${money(tdValue(u))}**`, ephemeral: true });
+      }
+      if (id === "menu_admin") {
+        return interaction.reply({ content: adminMenuText(), components: adminMenuButtons(), ephemeral: true });
+      }
+      if (id === "admin_commands") {
+        if (!isAdmin({ author: { id: interaction.user.id } })) return interaction.reply({ content: "⛔ Mày không có quyền admin.", ephemeral: true });
+        return interaction.reply({ content: adminMenuText(), ephemeral: true });
+      }
+      if (id === "menu_nhaytag") {
+        return interaction.showModal(nhayTagModal());
+      }
       if (id === "menu_tx") return interaction.reply({ content: txMenuText(), components: txButtons(), ephemeral: true });
       if (id === "menu_stock") return interaction.reply({ content: stockMenuText(), components: stockButtons(), ephemeral: true });
       if (id === "menu_treo") {
@@ -725,6 +824,9 @@ client.on("interactionCreate", async (interaction) => {
       }
       if (id === "menu_games") return interaction.reply({ content: `🎮 **GAME**\n\`.tx\` — Tài Xỉu\n\`.bc\` — Bầu Cua\n\`.nttv\` — Nối từ Việt\n\`.ntel\` — Nối từ Anh\n\`.tutien\` — Tu Tiên`, ephemeral: true });
       if (id === "menu_coin") return interaction.reply({ content: `💰 Dùng \`.tdcoin\` để xem số dư TDĐ.`, ephemeral: true });
+      if (id === "nhay_stop_button") {
+        return interaction.reply({ content: stopNhayTag(interaction.channelId) ? "🛑 Đã dừng nhây tag." : "❌ Không có nhây tag đang chạy.", ephemeral: true });
+      }
       if (id === "menu_stop") {
         const a = stopTreo(interaction.channelId);
         const b = stopNhayTag(interaction.channelId);
@@ -745,6 +847,19 @@ client.on("interactionCreate", async (interaction) => {
       if (id === "stock_buy" || id === "stock_sell") return interaction.showModal(createAmountModal(id === "stock_buy" ? "stock_modal_buy" : "stock_modal_sell", id === "stock_buy" ? "MUA TD STOCK" : "BÁN TD STOCK"));
     }
     if (interaction.isModalSubmit()) {
+      if (interaction.customId === "nhaytag_id_modal") {
+        if (!interaction.guild) return interaction.reply({ content: "❌ Chỉ dùng trong server.", ephemeral: true });
+        const targetId = interaction.fields.getTextInputValue("target_id").trim();
+        if (!/^\d{17,20}$/.test(targetId)) return interaction.reply({ content: "❌ ID Discord không hợp lệ.", ephemeral: true });
+        if (targetId === interaction.user.id) return interaction.reply({ content: "❌ Không thể nhây tag chính mình.", ephemeral: true });
+        const member = await interaction.guild.members.fetch(targetId).catch(() => null);
+        if (!member) return interaction.reply({ content: "❌ Không tìm thấy người dùng này trong server.", ephemeral: true });
+        if (member.user.bot) return interaction.reply({ content: "❌ Không nhây tag bot.", ephemeral: true });
+        const fake = { guild: interaction.guild, guildId: interaction.guildId, channelId: interaction.channelId, author: interaction.user, channel: interaction.channel };
+        const started = startNhayTag(fake, targetId, 5_000);
+        if (!started) return interaction.reply({ content: "❌ Không đọc được data/nhaytagtd.txt.", ephemeral: true });
+        return interaction.reply({ content: `🏷️ Đã bắt đầu nhây tag <@${targetId}> mỗi **5s**. Tối đa **${LOOP_MAX_MESSAGES} tin**; dùng nút Stop hoặc \.nhaystop để dừng.`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("nhay_stop_button").setLabel("Stop").setStyle(ButtonStyle.Danger))] });
+      }
       const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
       if (interaction.customId === "tx_modal_xiu" || interaction.customId === "tx_modal_tai") {
         if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
@@ -782,11 +897,14 @@ client.on("messageCreate", async (message) => {
     }
 
     if (message.guild && await checkWordGame(message)) return;
-    if (message.content.startsWith("!dmenu")) {
-      return message.reply({
-        content: `🎮 **TRIDUNG DEV MENU**\nChọn tính năng bằng nút bên dưới.\n\n🎲 Tài Xỉu: 35 giây\n📈 Chứng khoán: 15 giây\n🔁 Treo: có nút Treo/Stop\n💰 Tất cả dùng **TDĐ**`,
-        components: dmenuButtons()
-      });
+    if (message.content.trim().toLowerCase() === "!dmenu") {
+      const payload = { embeds: [dmenuEmbed(client)], components: dmenuButtons() };
+      if (fs.existsSync(DMENU_BANNER)) {
+        const file = new AttachmentBuilder(DMENU_BANNER);
+        payload.files = [file];
+        payload.embeds[0].setImage(`attachment://${path.basename(DMENU_BANNER)}`);
+      }
+      return message.reply(payload);
     }
 
     if (!message.content.startsWith(PREFIX)) return;
