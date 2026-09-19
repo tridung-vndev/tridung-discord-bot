@@ -36,157 +36,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
-// Persistence từ xa (khuyến nghị trên Render Free). Không ghi secret vào code.
-const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "bot_state";
-const REMOTE_DB_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-let remoteSaveTimer = null;
-let remoteSaveInFlight = Promise.resolve();
-
-const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
-const TX_WINDOW_MS = 35_000;
-const TX_HISTORY_LIMIT = 30;
-const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
-const LOOP_MAX_MESSAGES = 100;
-const LOOP_MIN_MS = 1_000; // Discord-safe minimum: 1s
-const LOOP_MAX_MS = 1_000_000; // 1000s
-const treoLoops = new Map();
-const nhayTagLoops = new Map();
-const stockRounds = new Map();
-const STOCK_WINDOW_MS = 15_000;
-const STOCK_IMAGE_BUY = path.join(__dirname, "assets", "stock-buy.jpg");
-const STOCK_IMAGE_SELL = path.join(__dirname, "assets", "stock-sell.jpg");
-const DICE_GIF = path.join(__dirname, "assets", "dice-roll.gif");
-const DMENU_BANNER = path.join(__dirname, "assets", "dmenu-banner.jpg");
-const ASSASSIN_ROOMS = ["Phòng Họp", "Phòng Ăn", "Nhà Kho", "Phòng Ngủ", "Ban Công", "Nhà Bếp", "Phòng Tài Vụ", "Phòng Vệ Sinh", "Phòng Chung"];
-const ASSASSIN_WINDOW_MS = 30_000;
-const assassinRounds = new Map();
-
-// ===== LÌ XÌ TOÀN BOT =====
-// MAIN_GUILD_ID/MAIN_CHANNEL_ID dùng để nhận báo cáo tổng kết. Nếu bỏ trống,
-// bot sẽ cố dùng system channel của server có OWNER_ID.
-const MAIN_GUILD_ID = process.env.MAIN_GUILD_ID || "";
-const MAIN_CHANNEL_ID = process.env.MAIN_CHANNEL_ID || "";
-let lixiState = null;
-
-function emptyDB() {
-  return { admins: [], users: {}, settings: {}, redeemedCodes: {}, lixi: null, assassinHistory: [] };
-}
-
-function loadDB() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-  } catch {
-    return emptyDB();
-  }
-}
-
-let db = loadDB();
-if (!db.admins) db.admins = [];
-if (!db.users) db.users = {};
-if (!db.settings) db.settings = {};
-if (!db.redeemedCodes) db.redeemedCodes = {};
-if (!("lixi" in db)) db.lixi = null;
-if (!Array.isArray(db.assassinHistory)) db.assassinHistory = [];;
-
-function normalizeDB(value) {
-  const x = value && typeof value === "object" ? value : emptyDB();
-  if (!x.admins) x.admins = [];
-  if (!x.users) x.users = {};
-  if (!x.settings) x.settings = {};
-  if (!x.redeemedCodes) x.redeemedCodes = {};
-  if (!("lixi" in x)) x.lixi = null;
-  if (!Array.isArray(x.assassinHistory)) x.assassinHistory = [];;
-  return x;
-}
-
-function writeLocalDB() {
-  const tmp = `${DB_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
-  fs.renameSync(tmp, DB_FILE);
-}
-
-async function remoteGetDB() {
-  if (!REMOTE_DB_ENABLED) return null;
-  const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}?id=eq.1&select=data`;
-  const res = await fetch(url, {
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-    }
-  });
-  if (!res.ok) throw new Error(`Supabase GET ${res.status}: ${await res.text()}`);
-  const rows = await res.json();
-  return rows.length ? normalizeDB(rows[0].data) : null;
-}
-
-async function remotePutDB(snapshot) {
-  if (!REMOTE_DB_ENABLED) return;
-  const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "resolution=merge-duplicates,return=minimal"
-    },
-    body: JSON.stringify([{ id: 1, data: snapshot, updated_at: new Date().toISOString() }])
-  });
-  if (!res.ok) throw new Error(`Supabase POST ${res.status}: ${await res.text()}`);
-}
-
-function queueRemoteSave() {
-  if (!REMOTE_DB_ENABLED) return;
-  clearTimeout(remoteSaveTimer);
-  remoteSaveTimer = setTimeout(() => {
-    const snapshot = JSON.parse(JSON.stringify(db));
-    remoteSaveInFlight = remoteSaveInFlight
-      .catch(() => {})
-      .then(() => remotePutDB(snapshot))
-      .then(() => console.log("DB remote: saved"))
-      .catch((err) => console.error("DB remote save failed:", err?.message || err));
-  }, 1000);
-}
-
-function saveDB() {
-  writeLocalDB();
-  queueRemoteSave();
-}
-
-async function initializePersistence() {
-  if (!REMOTE_DB_ENABLED) {
-    console.warn("DB remote: disabled. Render Free may lose local db.json after restart/sleep.");
-    lixiState = db.lixi || null;
-    return;
-  }
-  try {
-    const remote = await remoteGetDB();
-    if (remote) {
-      db = normalizeDB(remote);
-      writeLocalDB();
-      console.log("DB remote: restored from Supabase");
-    } else {
-      await remotePutDB(db);
-      console.log("DB remote: initialized from local db.json");
-    }
-  } catch (err) {
-    console.error("DB remote init failed; using local DB:", err?.message || err);
-  }
-  lixiState = db.lixi || null;
-}
-
-async function flushRemoteDB() {
-  if (!REMOTE_DB_ENABLED) return;
-  clearTimeout(remoteSaveTimer);
-  const snapshot = JSON.parse(JSON.stringify(db));
-  remoteSaveInFlight = remoteSaveInFlight
-    .catch(() => {})
-    .then(() => remotePutDB(snapshot))
-    .catch((err) => console.error("DB remote flush failed:", err?.message || err));
-  await remoteSaveInFlight;
-}
+// Lưu dữ liệu cục bộ vào data/db.json. Không cần Supabase.
+let saveTimer = null;
 
 function userData(id) {
   if (!db.users[id]) {
@@ -1680,7 +1531,7 @@ client.once("ready", () => {
 });
 
 async function boot() {
-  await initializePersistence();
+  initializePersistence();
   client.login(TOKEN).catch((err) => {
     console.error("Discord login failed:", err?.message || err);
     process.exit(1);
@@ -1690,7 +1541,7 @@ async function boot() {
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, async () => {
     console.log(`Received ${signal}; flushing database...`);
-    await flushRemoteDB();
+    flushLocalDB();
     process.exit(0);
   });
 }
