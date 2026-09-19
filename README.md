@@ -1,15 +1,17 @@
-# TriDung Discord Bot v14
+# TriDung Discord Bot v15 — Render Stable
 
-Bản v14 lưu dữ liệu bằng `data/db.json`, không cần Supabase.
+## Render
+- Runtime: Node.js
+- Build: `npm install`
+- Start: `npm run start`
+- Environment: `DISCORD_TOKEN`, `OWNER_ID`
+- Optional: `DATA_DIR`, `MAIN_GUILD_ID`, `MAIN_CHANNEL_ID`
 
-## Runtime variables
-- `DISCORD_TOKEN` — token bot Discord
-- `OWNER_ID` — Discord user ID của owner
-- `MAIN_GUILD_ID` — tùy chọn, server chính cho báo cáo
-- `MAIN_CHANNEL_ID` — tùy chọn, channel báo cáo
-- `DATA_DIR` — tùy chọn; mặc định `./data`
+## Health
+Render can use `/health` or `/healthz` for the HTTP health endpoint. The root path also returns a simple status.
 
-## Lưu dữ liệu
-TDĐ, user, admin, settings, mã redeem, lịch sử game và trạng thái lì xì được ghi vào `data/db.json`.
+## Database
+Uses local `data/db.json`. Writes are atomic and keep `db.json.bak`. **Render's free filesystem is not guaranteed to survive a redeploy/rebuild**, so use a persistent database/disk if permanent economy data is required.
 
-Lưu ý: `db.json` là lưu trên filesystem của service. Nếu nền tảng xoá/recreate filesystem khi deploy, dữ liệu local có thể mất. Bản v14 không dùng Supabase.
+## Important
+The bot does not self-ping Render or bypass Render sleep/usage limits.

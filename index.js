@@ -1,11 +1,21 @@
 const http = require("http");
-const PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("TriDung Dev Bot is running!");
-}).listen(PORT, "0.0.0.0", () => console.log(`Web server running on port ${PORT}`));
-
 require("dotenv").config();
+const PORT = Number(process.env.PORT || 10000);
+const healthServer = http.createServer((req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const payload = renderHealthPayload();
+  if (url.pathname === "/health" || url.pathname === "/healthz") {
+    res.writeHead(payload.ok ? 200 : 503, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify(payload));
+  }
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(`TriDung Dev Bot ${APP_VERSION} | ${payload.status} | uptime ${payload.processUptime}`);
+});
+healthServer.on("error", (err) => {
+  console.error("HTTP health server error:", err?.stack || err);
+  process.exitCode = 1;
+});
+healthServer.listen(PORT, "0.0.0.0", () => console.log(`Web/health server running on port ${PORT}`));
 
 const {
   Client,
@@ -23,6 +33,58 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+const PREFIX = ".";
+
+// ===================== RUNTIME / RENDER =====================
+const BOOT_TIME = Date.now();
+const APP_VERSION = "v15-render-stable";
+const TX_WINDOW_MS = 35_000;
+const TX_HISTORY_LIMIT = 20;
+const ASSASSIN_WINDOW_MS = 15_000;
+const STOCK_WINDOW_MS = 15_000;
+const ADMIN_START_TD = 1_000_000_000_000n;
+const LOOP_MAX_MESSAGES = 100;
+const LOOP_MIN_MS = 1_000;
+const LOOP_MAX_MS = 1_000_000; // 1000s
+const ASSASSIN_ROOMS = ["A", "B", "C", "D", "E", "F"];
+const DICE_GIF = path.join(__dirname, "assets", "dice-roll.gif");
+const OPENING_VIDEO = path.join(__dirname, "assets", "mo-bat.mp4");
+const DMENU_BANNER = path.join(__dirname, "assets", "dmenu-banner.jpg");
+const STOCK_IMAGE_BUY = path.join(__dirname, "assets", "stock-buy.jpg");
+const STOCK_IMAGE_SELL = path.join(__dirname, "assets", "stock-sell.jpg");
+const MAIN_CHANNEL_ID = process.env.MAIN_CHANNEL_ID || "";
+const MAIN_GUILD_ID = process.env.MAIN_GUILD_ID || "";
+
+const treoLoops = new Map();
+const nhayTagLoops = new Map();
+const assassinRounds = new Map();
+const stockRounds = new Map();
+let lixiState = null;
+
+function formatUptime(ms) {
+  const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${d}d ${h}h ${m}m ${s}s`;
+}
+
+function renderHealthPayload() {
+  return {
+    ok: true,
+    version: APP_VERSION,
+    status: "online",
+    processUptime: formatUptime(process.uptime() * 1000),
+    bootTime: new Date(BOOT_TIME).toISOString(),
+    discordReady: typeof client !== "undefined" && Boolean(client?.isReady?.()),
+    discordUptime: typeof client !== "undefined" && client?.isReady?.() ? formatUptime(client.uptime || 0) : "offline",
+    guilds: typeof client !== "undefined" && client?.isReady?.() ? client.guilds.cache.size : 0,
+    node: process.version,
+    render: Boolean(process.env.RENDER)
+  };
+}
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
 if (!TOKEN || !OWNER_ID) {
@@ -30,7 +92,6 @@ if (!TOKEN || !OWNER_ID) {
   process.exit(1);
 }
 
-const PREFIX = ".";
 // Render Free dùng filesystem ephemeral; nếu có DATA_DIR thì ưu tiên thư mục đó.
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -38,6 +99,62 @@ const DB_FILE = path.join(DATA_DIR, "db.json");
 
 // Lưu dữ liệu cục bộ vào data/db.json. Không cần Supabase.
 let saveTimer = null;
+
+const DEFAULT_DB = {
+  admins: [],
+  users: {},
+  settings: {},
+  redeemedCodes: {},
+  assassinHistory: [],
+  lixi: null
+};
+
+let db = structuredClone(DEFAULT_DB);
+
+function initializePersistence() {
+  try {
+    if (!fs.existsSync(DB_FILE)) {
+      db = structuredClone(DEFAULT_DB);
+      fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
+      return;
+    }
+
+    const raw = fs.readFileSync(DB_FILE, "utf8").trim();
+    const loaded = raw ? JSON.parse(raw) : {};
+    db = { ...structuredClone(DEFAULT_DB), ...loaded };
+    if (!Array.isArray(db.admins)) db.admins = [];
+    if (!db.users || typeof db.users !== "object") db.users = {};
+    if (!db.settings || typeof db.settings !== "object") db.settings = {};
+    if (!db.redeemedCodes || typeof db.redeemedCodes !== "object") db.redeemedCodes = {};
+    if (!Array.isArray(db.assassinHistory)) db.assassinHistory = [];
+    if (db.lixi && typeof db.lixi === "object") lixiState = db.lixi;
+    else lixiState = null;
+  } catch (err) {
+    console.error("Không đọc được db.json, dùng DB mặc định:", err?.message || err);
+    db = structuredClone(DEFAULT_DB);
+    lixiState = null;
+  }
+}
+
+function saveDB() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushLocalDB, 250);
+}
+
+function flushLocalDB() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${DB_FILE}.tmp`;
+    const backup = `${DB_FILE}.bak`;
+    const json = JSON.stringify(db, null, 2);
+    fs.writeFileSync(tmp, json, "utf8");
+    if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, backup);
+    fs.renameSync(tmp, DB_FILE);
+  } catch (err) {
+    console.error("Không lưu được db.json:", err?.stack || err);
+    try { fs.rmSync(`${DB_FILE}.tmp`, { force: true }); } catch {}
+  }
+}
 
 function userData(id) {
   if (!db.users[id]) {
@@ -708,15 +825,6 @@ function adminMenuButtons() {
     new ButtonBuilder().setCustomId("admin_commands").setLabel("🛡️ Lệnh Admin").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("back_dmenu").setLabel("↩️ Quay lại").setStyle(ButtonStyle.Secondary)
   )];
-}
-
-function formatUptime(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const d = Math.floor(total / 86400);
-  const h = Math.floor((total % 86400) / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  return `${d}d ${h}h ${m}m ${s}s`;
 }
 
 function cpuLoadText() {
@@ -1530,18 +1638,43 @@ client.once("ready", () => {
   console.log(`Guilds: ${client.guilds.cache.size}`);
 });
 
+let shuttingDown = false;
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason?.stack || reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err?.stack || err);
+  flushLocalDB();
+  process.exit(1);
+});
+
+client.on("error", (err) => console.error("Discord client error:", err?.stack || err));
+client.on("warn", (msg) => console.warn("Discord warning:", msg));
+
 async function boot() {
   initializePersistence();
-  client.login(TOKEN).catch((err) => {
-    console.error("Discord login failed:", err?.message || err);
+  console.log(`[BOOT] ${APP_VERSION} | Node ${process.version} | Render=${Boolean(process.env.RENDER)}`);
+  console.log(`[BOOT] DB=${DB_FILE}`);
+  try {
+    await client.login(TOKEN);
+  } catch (err) {
+    console.error("Discord login failed:", err?.stack || err);
+    try { healthServer.close(); } catch {}
     process.exit(1);
-  });
+  }
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`Received ${signal}; flushing database...`);
+    clearTimeout(saveTimer);
     flushLocalDB();
+    try { healthServer.close(); } catch {}
+    try { client.destroy(); } catch {}
     process.exit(0);
   });
 }
