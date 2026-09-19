@@ -1,6 +1,6 @@
 {
   "name": "tridung-discord-bot",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "TriDung Discord bot with TD Dong economy, games, moderation and cultivation RPG.",
   "main": "index.js",
   "type": "commonjs",

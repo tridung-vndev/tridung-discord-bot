@@ -31,7 +31,19 @@ if (!TOKEN || !OWNER_ID) {
 }
 
 const PREFIX = ".";
-const DB_FILE = path.join(__dirname, "data", "db.json");
+// Render Free dùng filesystem ephemeral; nếu có DATA_DIR thì ưu tiên thư mục đó.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_FILE = path.join(DATA_DIR, "db.json");
+
+// Persistence từ xa (khuyến nghị trên Render Free). Không ghi secret vào code.
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "bot_state";
+const REMOTE_DB_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+let remoteSaveTimer = null;
+let remoteSaveInFlight = Promise.resolve();
+
 const ADMIN_START_TD = 1000000000000000000n; // 1.000.000.000 tỷ TDĐ = 10^18
 const TX_WINDOW_MS = 35_000;
 const TX_HISTORY_LIMIT = 30;
@@ -47,12 +59,26 @@ const STOCK_IMAGE_BUY = path.join(__dirname, "assets", "stock-buy.jpg");
 const STOCK_IMAGE_SELL = path.join(__dirname, "assets", "stock-sell.jpg");
 const DICE_GIF = path.join(__dirname, "assets", "dice-roll.gif");
 const DMENU_BANNER = path.join(__dirname, "assets", "dmenu-banner.jpg");
+const ASSASSIN_ROOMS = ["Phòng Họp", "Phòng Ăn", "Nhà Kho", "Phòng Ngủ", "Ban Công", "Nhà Bếp", "Phòng Tài Vụ", "Phòng Vệ Sinh", "Phòng Chung"];
+const ASSASSIN_WINDOW_MS = 30_000;
+const assassinRounds = new Map();
+
+// ===== LÌ XÌ TOÀN BOT =====
+// MAIN_GUILD_ID/MAIN_CHANNEL_ID dùng để nhận báo cáo tổng kết. Nếu bỏ trống,
+// bot sẽ cố dùng system channel của server có OWNER_ID.
+const MAIN_GUILD_ID = process.env.MAIN_GUILD_ID || "";
+const MAIN_CHANNEL_ID = process.env.MAIN_CHANNEL_ID || "";
+let lixiState = null;
+
+function emptyDB() {
+  return { admins: [], users: {}, settings: {}, redeemedCodes: {}, lixi: null, assassinHistory: [] };
+}
 
 function loadDB() {
   try {
     return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
   } catch {
-    return { admins: [], users: {}, settings: {}, redeemedCodes: {} };
+    return emptyDB();
   }
 }
 
@@ -61,9 +87,105 @@ if (!db.admins) db.admins = [];
 if (!db.users) db.users = {};
 if (!db.settings) db.settings = {};
 if (!db.redeemedCodes) db.redeemedCodes = {};
+if (!("lixi" in db)) db.lixi = null;
+if (!Array.isArray(db.assassinHistory)) db.assassinHistory = [];;
+
+function normalizeDB(value) {
+  const x = value && typeof value === "object" ? value : emptyDB();
+  if (!x.admins) x.admins = [];
+  if (!x.users) x.users = {};
+  if (!x.settings) x.settings = {};
+  if (!x.redeemedCodes) x.redeemedCodes = {};
+  if (!("lixi" in x)) x.lixi = null;
+  if (!Array.isArray(x.assassinHistory)) x.assassinHistory = [];;
+  return x;
+}
+
+function writeLocalDB() {
+  const tmp = `${DB_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
+  fs.renameSync(tmp, DB_FILE);
+}
+
+async function remoteGetDB() {
+  if (!REMOTE_DB_ENABLED) return null;
+  const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}?id=eq.1&select=data`;
+  const res = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+    }
+  });
+  if (!res.ok) throw new Error(`Supabase GET ${res.status}: ${await res.text()}`);
+  const rows = await res.json();
+  return rows.length ? normalizeDB(rows[0].data) : null;
+}
+
+async function remotePutDB(snapshot) {
+  if (!REMOTE_DB_ENABLED) return;
+  const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal"
+    },
+    body: JSON.stringify([{ id: 1, data: snapshot, updated_at: new Date().toISOString() }])
+  });
+  if (!res.ok) throw new Error(`Supabase POST ${res.status}: ${await res.text()}`);
+}
+
+function queueRemoteSave() {
+  if (!REMOTE_DB_ENABLED) return;
+  clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = setTimeout(() => {
+    const snapshot = JSON.parse(JSON.stringify(db));
+    remoteSaveInFlight = remoteSaveInFlight
+      .catch(() => {})
+      .then(() => remotePutDB(snapshot))
+      .then(() => console.log("DB remote: saved"))
+      .catch((err) => console.error("DB remote save failed:", err?.message || err));
+  }, 1000);
+}
 
 function saveDB() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
+  writeLocalDB();
+  queueRemoteSave();
+}
+
+async function initializePersistence() {
+  if (!REMOTE_DB_ENABLED) {
+    console.warn("DB remote: disabled. Render Free may lose local db.json after restart/sleep.");
+    lixiState = db.lixi || null;
+    return;
+  }
+  try {
+    const remote = await remoteGetDB();
+    if (remote) {
+      db = normalizeDB(remote);
+      writeLocalDB();
+      console.log("DB remote: restored from Supabase");
+    } else {
+      await remotePutDB(db);
+      console.log("DB remote: initialized from local db.json");
+    }
+  } catch (err) {
+    console.error("DB remote init failed; using local DB:", err?.message || err);
+  }
+  lixiState = db.lixi || null;
+}
+
+async function flushRemoteDB() {
+  if (!REMOTE_DB_ENABLED) return;
+  clearTimeout(remoteSaveTimer);
+  const snapshot = JSON.parse(JSON.stringify(db));
+  remoteSaveInFlight = remoteSaveInFlight
+    .catch(() => {})
+    .then(() => remotePutDB(snapshot))
+    .catch((err) => console.error("DB remote flush failed:", err?.message || err));
+  await remoteSaveInFlight;
 }
 
 function userData(id) {
@@ -591,6 +713,117 @@ function stockButtons() {
   )];
 }
 
+function assassinRoomRows(disabled = false) {
+  const rows = [];
+  for (let i = 0; i < ASSASSIN_ROOMS.length; i += 3) {
+    rows.push(new ActionRowBuilder().addComponents(
+      ...ASSASSIN_ROOMS.slice(i, i + 3).map((room, j) =>
+        new ButtonBuilder().setCustomId(`assassin_room_${i + j}`).setLabel(room).setStyle(ButtonStyle.Secondary).setDisabled(disabled)
+      )
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("assassin_gift").setLabel("🎁 Gift TDĐ").setStyle(ButtonStyle.Success)
+  ));
+  return rows;
+}
+
+function assassinMenuEmbed(round = null) {
+  const history = db.assassinHistory?.length
+    ? db.assassinHistory.slice(-5).reverse().map((h, i) => `**${i + 1}.** ${h.a} + ${h.b} → sống sót: ${h.safe.join(", ")}`).join("\\n")
+    : "Chưa có lịch sử.";
+  const left = round ? Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000)) : 0;
+  return new EmbedBuilder()
+    .setTitle("🔪 CĂN PHÒNG SÁT THỦ")
+    .setDescription(
+      round && !round.finished
+        ? `⏳ **CÒN ${left}s** để đặt TDĐ.\\n\\nChọn một căn phòng bên dưới, sau đó nhập số TDĐ.\\nCó **2 sát thủ**, mỗi sát thủ chọn **1 phòng khác nhau**.\\n🛡️ Phòng sống sót nhận **x1,9** tiền cược.\\n💀 Phòng có sát thủ mất tiền cược.\\n\\n📜 **Lịch sử 5 lượt gần nhất**\\n${history}`
+        : `🎮 Bấm một căn phòng để mở lượt mới.\\n\\nCó **2 sát thủ** chọn 2 phòng. Mỗi người chỉ đặt **1 lần/lượt**.\\n🛡️ Sống sót: nhận **x1,9** tiền cược.\\n\\n📜 **Lịch sử 5 lượt gần nhất**\\n${history}`
+    )
+    .setTimestamp();
+}
+
+function assassinBetModal(index) {
+  return new ModalBuilder().setCustomId(`assassin_bet_${index}`).setTitle(`Đặt TDĐ — ${ASSASSIN_ROOMS[index]}`).addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("amount").setLabel("Số TDĐ muốn đặt").setStyle(TextInputStyle.Short).setPlaceholder("Ví dụ: 1000").setRequired(true).setMaxLength(18)
+    )
+  );
+}
+
+function giftModal() {
+  return new ModalBuilder().setCustomId("gift_td_modal").setTitle("🎁 Gift TDĐ").addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("target_id").setLabel("ID người nhận").setStyle(TextInputStyle.Short).setPlaceholder("123456789012345678").setRequired(true).setMinLength(17).setMaxLength(20)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("amount").setLabel("Số TDĐ muốn tặng").setStyle(TextInputStyle.Short).setPlaceholder("Ví dụ: 5000").setRequired(true).setMaxLength(18))
+  );
+}
+
+function assassinKey(interaction) { return `${interaction.guildId}:${interaction.channelId}`; }
+
+function startAssassinRound(message) {
+  const key = `${message.guildId}:${message.channelId}`;
+  if (assassinRounds.has(key)) return assassinRounds.get(key);
+  const round = { key, guildId: message.guildId, channelId: message.channelId, createdAt: Date.now(), endsAt: Date.now() + ASSASSIN_WINDOW_MS, bets: new Map(), finished: false, messageId: null, timer: null, countdown: null };
+  assassinRounds.set(key, round);
+  round.timer = setTimeout(() => finishAssassinRound(round, message.channel), ASSASSIN_WINDOW_MS);
+  round.countdown = setInterval(async () => {
+    if (round.finished) return;
+    const msg = round.messageId ? await message.channel.messages.fetch(round.messageId).catch(() => null) : null;
+    if (!msg) return;
+    const left = Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000));
+    if (left <= 0) return;
+    await msg.edit({ embeds: [assassinMenuEmbed(round)], components: assassinRoomRows(false) }).catch(() => {});
+  }, 5000);
+  return round;
+}
+
+async function finishAssassinRound(round, channel) {
+  if (!round || round.finished) return;
+  round.finished = true;
+  clearTimeout(round.timer); clearInterval(round.countdown);
+  const killers = [...ASSASSIN_ROOMS].sort(() => Math.random() - 0.5).slice(0, 2);
+  const result = [];
+  for (const bet of round.bets.values()) {
+    const u = userData(bet.userId);
+    if (!killers.includes(bet.room)) {
+      const payout = (BigInt(bet.amount) * 19n) / 10n;
+      addTD(u, payout);
+      result.push(`🛡️ <@${bet.userId}> — ${bet.room}: **SỐNG** +${money(payout)} TDĐ`);
+    } else {
+      result.push(`💀 <@${bet.userId}> — ${bet.room}: **BỊ SÁT THỦ** -${money(BigInt(bet.amount))} TDĐ`);
+    }
+  }
+  db.assassinHistory ||= [];
+  db.assassinHistory.push({ at: Date.now(), a: killers[0], b: killers[1], safe: ASSASSIN_ROOMS.filter(r => !killers.includes(r)) });
+  db.assassinHistory = db.assassinHistory.slice(-20);
+  saveDB();
+  assassinRounds.delete(round.key);
+  const history = db.assassinHistory.slice(-5).reverse().map((h, i) => `**${i + 1}.** ${h.a} + ${h.b} → sống sót: ${h.safe.join(", ")}`).join("\\n");
+  const embed = new EmbedBuilder().setTitle("🔪 KẾT QUẢ CĂN PHÒNG SÁT THỦ").setDescription(`💀 **Sát thủ:** ${killers.map(x => `**${x}**`).join(" và ")}\\n\\n${result.length ? result.join("\\n") : "Không có người đặt."}\\n\\n📜 **Lịch sử**\\n${history}`).setTimestamp();
+  await channel.send({ embeds: [embed], components: assassinRoomRows(false) }).catch(() => {});
+}
+
+async function placeAssassinBet(interaction, index, amount) {
+  if (!interaction.guild) return interaction.reply({ content: "❌ Chỉ dùng trong server.", ephemeral: true });
+  const room = ASSASSIN_ROOMS[index];
+  if (!room) return interaction.reply({ content: "❌ Phòng không hợp lệ.", ephemeral: true });
+  let round = assassinRounds.get(assassinKey(interaction));
+  if (!round) {
+    round = startAssassinRound({ guildId: interaction.guildId, channelId: interaction.channelId, author: interaction.user, channel: interaction.channel });
+    const msg = await interaction.channel.send({ embeds: [assassinMenuEmbed(round)], components: assassinRoomRows(false) });
+    round.messageId = msg.id;
+  }
+  if (round.finished || Date.now() >= round.endsAt) return interaction.reply({ content: "⏰ Hết thời gian đặt.", ephemeral: true });
+  if (round.bets.has(interaction.user.id)) return interaction.reply({ content: "❌ Mỗi người chỉ được đặt 1 phòng trong một lượt.", ephemeral: true });
+  const u = userData(interaction.user.id);
+  if (tdValue(u) < amount) return interaction.reply({ content: `❌ Không đủ TDĐ. M đang có **${money(tdValue(u))} TDĐ**.`, ephemeral: true });
+  setTD(u, tdValue(u) - amount);
+  round.bets.set(interaction.user.id, { userId: interaction.user.id, room, amount: amount.toString() });
+  saveDB();
+  const left = Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000));
+  return interaction.reply({ content: `🔪 Đã đặt **${money(amount)} TDĐ** vào **${room}**. Còn **${left}s**.`, ephemeral: true });
+}
+
 function dmenuButtons() {
   return [
     new ActionRowBuilder().addComponents(
@@ -604,7 +837,9 @@ function dmenuButtons() {
       new ButtonBuilder().setCustomId("menu_nhaytag").setLabel("🏷️ Nhây Tag").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("menu_games").setLabel("🎮 Game").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("menu_coin").setLabel("💰 TD Đồng").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("menu_stop").setLabel("🛑 Stop").setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId("menu_stop").setLabel("🛑 Stop").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("menu_lixi").setLabel("🎁 Lì Xì").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("menu_assassin").setLabel("🔪 Sát Thủ").setStyle(ButtonStyle.Danger)
     )
   ];
 }
@@ -652,7 +887,7 @@ function dmenuEmbed(client) {
       `⏱️ **Uptime**\n**${formatUptime(client.uptime || 0)}**\n\n` +
       `🌐 **Máy chủ**\n**${client.guilds.cache.size}**`
     )
-    .setFooter({ text: "TRIDUNG DEV • !dmenu" })
+    .setFooter({ text: "TRIDUNG DEV • .dmenu" })
     .setTimestamp();
 }
 
@@ -772,6 +1007,149 @@ async function placeStockBet(interaction, choice, amount) {
   return interaction.reply({ content: `📈 Đã đặt **${money(amount)} TDĐ** vào **${choice === "buy" ? "MUA" : "BÁN"}**. Còn ~**${Math.ceil(left / 1000)}s**.`, ephemeral: true });
 }
 
+
+// ===================== LÌ XÌ =====================
+function lixiButtons(active = true) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("lixi_claim")
+      .setLabel(active ? "🎁 Nhận Lì Xì" : "🎁 Lì Xì đã kết thúc")
+      .setStyle(active ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setDisabled(!active)
+  )];
+}
+
+function lixiAdminModal() {
+  return new ModalBuilder().setCustomId("lixi_create_modal").setTitle("🎁 Tạo Lì Xì Toàn Bot").addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("total").setLabel("Tổng tiền lì xì (TDĐ)").setStyle(TextInputStyle.Short).setPlaceholder("Ví dụ: 100000").setRequired(true).setMaxLength(24)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId("recipients").setLabel("Số người nhận").setStyle(TextInputStyle.Short).setPlaceholder("Ví dụ: 20").setRequired(true).setMaxLength(4)
+    )
+  );
+}
+
+function randomLixiShares(total, count) {
+  total = BigInt(total);
+  count = Number(count);
+  if (count <= 0 || total < BigInt(count)) return null;
+  const remaining = total - BigInt(count);
+  const weights = Array.from({ length: count }, () => Math.floor(Math.random() * 100000) + 1);
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+  const shares = [];
+  let allocated = 0n;
+  for (let i = 0; i < count - 1; i++) {
+    const extra = (remaining * BigInt(weights[i])) / BigInt(weightSum);
+    const value = 1n + extra;
+    shares.push(value);
+    allocated += value;
+  }
+  shares.push(total - allocated);
+  // Trộn thứ tự để không đoán được người nhận nào được nhiều hơn.
+  for (let i = shares.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shares[i], shares[j]] = [shares[j], shares[i]];
+  }
+  return shares;
+}
+
+function persistLixi() {
+  db.lixi = lixiState;
+  saveDB();
+}
+
+function getMainReportChannel() {
+  if (MAIN_CHANNEL_ID) {
+    const c = client.channels.cache.get(MAIN_CHANNEL_ID);
+    if (c?.isTextBased()) return c;
+  }
+  if (MAIN_GUILD_ID) {
+    const g = client.guilds.cache.get(MAIN_GUILD_ID);
+    const c = g?.systemChannel;
+    if (c?.isTextBased()) return c;
+  }
+  const ownerGuild = client.guilds.cache.find(g => g.members.cache.has(OWNER_ID));
+  return ownerGuild?.systemChannel?.isTextBased() ? ownerGuild.systemChannel : null;
+}
+
+async function broadcastLixi(payload) {
+  const tasks = [];
+  for (const guild of client.guilds.cache.values()) {
+    let channel = guild.systemChannel;
+    if (!channel?.isTextBased()) {
+      channel = guild.channels.cache.find(c => c.isTextBased() && c.viewable && c.permissionsFor(client.user)?.has("SendMessages"));
+    }
+    if (!channel?.isTextBased()) continue;
+    tasks.push(channel.send(payload).catch(err => console.error(`Lixi broadcast ${guild.id}:`, err?.message || err)));
+  }
+  await Promise.allSettled(tasks);
+}
+
+async function createLixi(interaction, total, recipientCount) {
+  if (lixiState?.active) return interaction.reply({ content: "⏳ Đang có một gói lì xì toàn bot chưa kết thúc.", ephemeral: true });
+  if (recipientCount < 1 || recipientCount > 500) return interaction.reply({ content: "❌ Số người nhận phải từ 1 đến 500.", ephemeral: true });
+  if (total < BigInt(recipientCount)) return interaction.reply({ content: "❌ Tổng TDĐ phải ít nhất bằng số người nhận (mỗi người tối thiểu 1 TDĐ).", ephemeral: true });
+
+  const shares = randomLixiShares(total, recipientCount);
+  if (!shares) return interaction.reply({ content: "❌ Không tạo được gói lì xì.", ephemeral: true });
+
+  lixiState = {
+    active: true,
+    createdAt: Date.now(),
+    creatorId: interaction.user.id,
+    total: total.toString(),
+    recipientCount,
+    claimedCount: 0,
+    claimedTotal: "0",
+    claimedUsers: {},
+    shares: shares.map(String)
+  };
+  persistLixi();
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎁 LÌ XÌ TOÀN BOT")
+    .setDescription(
+      `👑 Admin: <@${interaction.user.id}>\n` +
+      `💰 Tổng quỹ: **${money(total)} TDĐ**\n` +
+      `👥 Số người nhận: **${recipientCount}**\n\n` +
+      `🎲 Mỗi người nhận một phần **ngẫu nhiên**. Tổng các phần đúng bằng **${money(total)} TDĐ**.\n` +
+      `🌐 Gói lì xì này được mở trên **tất cả server đang có bot**.\n\n` +
+      `Nhanh tay bấm **Nhận Lì Xì**!`
+    )
+    .setTimestamp();
+
+  await interaction.reply({ content: "✅ Đã tạo lì xì và phát tới tất cả server.", ephemeral: true });
+  await broadcastLixi({ embeds: [embed], components: lixiButtons(true) });
+}
+
+async function claimLixi(interaction) {
+  if (!lixiState?.active) return interaction.reply({ content: "🎁 Hiện không có gói lì xì đang mở.", ephemeral: true });
+  const uid = interaction.user.id;
+  if (lixiState.claimedUsers?.[uid]) return interaction.reply({ content: "❌ Mỗi tài khoản chỉ được nhận lì xì 1 lần.", ephemeral: true });
+  if (lixiState.claimedCount >= lixiState.recipientCount || !lixiState.shares.length) return interaction.reply({ content: "🎁 Lì xì đã phát hết.", ephemeral: true });
+
+  const amount = BigInt(lixiState.shares.shift());
+  const u = userData(uid);
+  addTD(u, amount);
+  lixiState.claimedUsers[uid] = true;
+  lixiState.claimedCount += 1;
+  lixiState.claimedTotal = (BigInt(lixiState.claimedTotal) + amount).toString();
+  const finished = lixiState.claimedCount >= lixiState.recipientCount || lixiState.shares.length === 0;
+  if (finished) lixiState.active = false;
+  persistLixi();
+
+  await interaction.reply({ content: `🎉 **${interaction.user.displayName}** nhận được **${money(amount)} TDĐ** từ lì xì!\n💰 Số dư: **${money(tdValue(u))} TDĐ**`, ephemeral: false });
+
+  if (finished) {
+    const summary = `🎊 **LÌ XÌ ĐÃ PHÁT HẾT**\n👥 Người nhận: **${lixiState.claimedCount}/${lixiState.recipientCount}**\n💰 Tổng tiền đã phát: **${money(BigInt(lixiState.claimedTotal))} TDĐ**\n🌐 Gói lì xì của <@${lixiState.creatorId}> đã kết thúc.`;
+    const report = getMainReportChannel();
+    if (report) await report.send(summary).catch(() => {});
+    await broadcastLixi({ content: summary, components: lixiButtons(false) });
+    persistLixi();
+  }
+}
+
 // ===================== DISCORD =====================
 const client = new Client({
   intents: [
@@ -808,6 +1186,11 @@ client.on("interactionCreate", async (interaction) => {
       if (id === "menu_admin") {
         return interaction.reply({ content: adminMenuText(), components: adminMenuButtons(), ephemeral: true });
       }
+      if (id === "menu_lixi") {
+        if (!isAdmin({ author: { id: interaction.user.id } })) return interaction.reply({ content: "⛔ Chỉ OWNER/ADMIN mới dùng được nút Lì Xì.", ephemeral: true });
+        return interaction.showModal(lixiAdminModal());
+      }
+      if (id === "lixi_claim") return claimLixi(interaction);
       if (id === "admin_commands") {
         if (!isAdmin({ author: { id: interaction.user.id } })) return interaction.reply({ content: "⛔ Mày không có quyền admin.", ephemeral: true });
         return interaction.reply({ content: adminMenuText(), ephemeral: true });
@@ -825,7 +1208,16 @@ client.on("interactionCreate", async (interaction) => {
         );
         return interaction.showModal(modal);
       }
-      if (id === "menu_games") return interaction.reply({ content: `🎮 **GAME**\n\`.tx\` — Tài Xỉu\n\`.bc\` — Bầu Cua\n\`.nttv\` — Nối từ Việt\n\`.ntel\` — Nối từ Anh\n\`.tutien\` — Tu Tiên`, ephemeral: true });
+      if (id === "menu_assassin") {
+        const round = assassinRounds.get(`${interaction.guildId}:${interaction.channelId}`);
+        return interaction.reply({ embeds: [assassinMenuEmbed(round || null)], components: assassinRoomRows(false), ephemeral: true });
+      }
+      if (id.startsWith("assassin_room_")) {
+        const index = Number(id.slice("assassin_room_".length));
+        return interaction.showModal(assassinBetModal(index));
+      }
+      if (id === "assassin_gift") return interaction.showModal(giftModal());
+      if (id === "menu_games") return interaction.reply({ content: `🎮 **GAME**\n\`.tx\` — Tài Xỉu\n\`.bc\` — Bầu Cua\n\`.nttv\` — Nối từ Việt\n\`.ntel\` — Nối từ Anh\n\`.tutien\` — Tu Tiên`, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("menu_assassin").setLabel("🔪 Căn Phòng Sát Thủ").setStyle(ButtonStyle.Danger), new ButtonBuilder().setCustomId("assassin_gift").setLabel("🎁 Gift TDĐ").setStyle(ButtonStyle.Success))], ephemeral: true });
       if (id === "menu_coin") return interaction.reply({ content: `💰 Dùng \`.tdcoin\` để xem số dư TDĐ.`, ephemeral: true });
       if (id === "nhay_stop_button") {
         return interaction.reply({ content: stopNhayTag(interaction.channelId) ? "🛑 Đã dừng nhây tag." : "❌ Không có nhây tag đang chạy.", ephemeral: true });
@@ -850,6 +1242,34 @@ client.on("interactionCreate", async (interaction) => {
       if (id === "stock_buy" || id === "stock_sell") return interaction.showModal(createAmountModal(id === "stock_buy" ? "stock_modal_buy" : "stock_modal_sell", id === "stock_buy" ? "MUA TD STOCK" : "BÁN TD STOCK"));
     }
     if (interaction.isModalSubmit()) {
+      if (interaction.customId === "lixi_create_modal") {
+        if (!isAdmin({ author: { id: interaction.user.id } })) return interaction.reply({ content: "⛔ Chỉ OWNER/ADMIN mới dùng được.", ephemeral: true });
+        const total = parseAmount(interaction.fields.getTextInputValue("total"));
+        const recipientCount = Number(interaction.fields.getTextInputValue("recipients"));
+        if (!total) return interaction.reply({ content: "❌ Tổng TDĐ không hợp lệ.", ephemeral: true });
+        if (!Number.isInteger(recipientCount)) return interaction.reply({ content: "❌ Số người nhận không hợp lệ.", ephemeral: true });
+        return createLixi(interaction, total, recipientCount);
+      }
+      if (interaction.customId === "gift_td_modal") {
+        const targetId = interaction.fields.getTextInputValue("target_id").trim();
+        const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
+        if (!/^\d{17,20}$/.test(targetId)) return interaction.reply({ content: "❌ ID Discord không hợp lệ.", ephemeral: true });
+        if (targetId === interaction.user.id) return interaction.reply({ content: "❌ Không thể tự tặng cho chính mình.", ephemeral: true });
+        if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
+        const sender = userData(interaction.user.id);
+        if (tdValue(sender) < amount) return interaction.reply({ content: `❌ Không đủ TDĐ. M đang có **${money(tdValue(sender))} TDĐ**.`, ephemeral: true });
+        const target = userData(targetId);
+        setTD(sender, tdValue(sender) - amount);
+        addTD(target, amount);
+        saveDB();
+        return interaction.reply({ content: `🎁 ${interaction.user} đã tặng **${money(amount)} TDĐ** cho <@${targetId}>.\n💰 Số dư của m: **${money(tdValue(sender))} TDĐ**`, ephemeral: false });
+      }
+      if (interaction.customId.startsWith("assassin_bet_")) {
+        const index = Number(interaction.customId.slice("assassin_bet_".length));
+        const amount = parseAmount(interaction.fields.getTextInputValue("amount"));
+        if (!amount) return interaction.reply({ content: "❌ Số TDĐ không hợp lệ.", ephemeral: true });
+        return placeAssassinBet(interaction, index, amount);
+      }
       if (interaction.customId === "nhaytag_id_modal") {
         if (!interaction.guild) return interaction.reply({ content: "❌ Chỉ dùng trong server.", ephemeral: true });
         const targetId = interaction.fields.getTextInputValue("target_id").trim();
@@ -975,6 +1395,12 @@ client.on("messageCreate", async (message) => {
 
 \`.ntstop\` — Dừng game nối từ`
       );
+    }
+
+    // ===== CĂN PHÒNG SÁT THỦ =====
+    if (cmd === "satthu") {
+      const round = assassinRounds.get(`${message.guildId}:${message.channelId}`);
+      return message.reply({ embeds: [assassinMenuEmbed(round || null)], components: assassinRoomRows(false) });
     }
 
     // ===== ADMIN =====
@@ -1253,7 +1679,20 @@ client.once("ready", () => {
   console.log(`Guilds: ${client.guilds.cache.size}`);
 });
 
-client.login(TOKEN).catch((err) => {
-  console.error("Discord login failed:", err?.message || err);
-  process.exit(1);
-});
+async function boot() {
+  await initializePersistence();
+  client.login(TOKEN).catch((err) => {
+    console.error("Discord login failed:", err?.message || err);
+    process.exit(1);
+  });
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    console.log(`Received ${signal}; flushing database...`);
+    await flushRemoteDB();
+    process.exit(0);
+  });
+}
+
+boot();
